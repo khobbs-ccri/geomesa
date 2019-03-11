@@ -44,6 +44,8 @@ import org.specs2.mock.Mockito
 import org.specs2.mutable.Specification
 import org.specs2.runner.JUnitRunner
 
+import scala.util.{Success, Try}
+
 @RunWith(classOf[JUnitRunner])
 class KafkaDataStoreTest extends Specification with Mockito with LazyLogging {
 
@@ -168,6 +170,42 @@ class KafkaDataStoreTest extends Specification with Mockito with LazyLogging {
           producer.dispose()
         }
       }
+    }
+
+    "support configurable anti-meridian handeling" >> {
+      val feature_lists = List("spatial4j", "none").map( processing => {
+        System.setProperty("geomesa.geometry.processing", processing )
+        val ( producer,  consumer,  sft) = createStorePair(processing + "processing", Map())
+        val features = Try({
+          producer.createSchema(sft)
+
+          val store = consumer.getFeatureSource(sft.getTypeName) // start the consumer polling
+
+          val f0 = ScalaSimpleFeature.create(sft, "sm", "smith", 30, "2017-01-01T00:00:00.000Z", "POINT (-180 0)")
+          val f1 = ScalaSimpleFeature.create(sft, "jo", "jones", 20, "2017-01-02T00:00:00.000Z", "POINT (-60 0)")
+          val f2 = ScalaSimpleFeature.create(sft, "do", "doe", 40, "2017-01-02T00:00:00.000Z", "POINT (60 0)")
+          WithClose(producer.getFeatureWriterAppend(sft.getTypeName, Transaction.AUTO_COMMIT)) { writer =>
+            Seq(f0, f1, f2).foreach { f =>
+              FeatureUtils.copyToWriter(writer, f, useProvidedFid = true)
+              writer.write()
+            }
+          }
+          eventually(40, 100.millis)(SelfClosingIterator(store.getFeatures.features).toSeq must containTheSameElementsAs(Seq(f0, f1, f2)))
+
+          val query_string = "INTERSECTS(geom, POLYGON((-179 90, 179 90, 179 -90, -179 -90, -179 90)))"
+
+          val query = new Query(sft.getTypeName, ECQL.toFilter(query_string))
+          SelfClosingIterator(consumer.getFeatureReader(query, Transaction.AUTO_COMMIT)).toList
+        }) match {
+          case Success(f) => f
+          case _ => Seq()
+        }
+        producer.dispose()
+        consumer.dispose()
+        features
+      })
+      feature_lists(0) must haveLength(1)
+      feature_lists(1) must haveLength(2)
     }
 
     "write/update/read/delete features" >> {
